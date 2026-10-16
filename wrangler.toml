@@ -1,0 +1,26 @@
+# Cloudflare tự build & deploy Worker từ repo GitHub này (Workers Builds).
+# D1 và R2 không ghi ID → Cloudflare tự tạo ở lần deploy đầu (automatic provisioning).
+name = "nha-chat-api"
+main = "src/index.js"
+compatibility_date = "2026-09-01"
+
+[vars]
+APP_URL = "https://nha.tytlinhxuan.cloud"
+
+[[d1_databases]]
+binding = "DB"
+
+[[r2_buckets]]
+binding = "BUCKET"
+
+# Thời gian thực (WebSocket) — Durable Object bản SQLite, miễn phí
+[[durable_objects.bindings]]
+name = "HUB"
+class_name = "Hub"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Hub"]
+
+[observability]
+enabled = true
