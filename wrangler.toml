@@ -1,5 +1,5 @@
 # Cloudflare tự build & deploy Worker từ repo GitHub này (Workers Builds).
-# D1 và R2 không ghi ID → Cloudflare tự tạo ở lần deploy đầu (automatic provisioning).
+# D1 đã tạo ở lần deploy đầu (ghi ID cố định bên dưới). R2: kho ảnh/tệp tên nha-chat-files.
 name = "nha-chat-api"
 main = "src/index.js"
 compatibility_date = "2026-09-01"
@@ -9,9 +9,12 @@ APP_URL = "https://nha.tytlinhxuan.cloud"
 
 [[d1_databases]]
 binding = "DB"
+database_name = "nha-chat-api-db"
+database_id = "deae60ab-da0c-4e6d-9ab9-c63df4fbd4be"
 
 [[r2_buckets]]
 binding = "BUCKET"
+bucket_name = "nha-chat-files"
 
 # Thời gian thực (WebSocket) — Durable Object bản SQLite, miễn phí
 [[durable_objects.bindings]]
