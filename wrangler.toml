@@ -1,5 +1,5 @@
 # Cloudflare tự build & deploy Worker từ repo GitHub này (Workers Builds).
-# D1 đã tạo ở lần deploy đầu (ghi ID cố định bên dưới). R2: kho ảnh/tệp tên nha-chat-files.
+# D1 đã tạo ở lần deploy đầu (ghi ID cố định bên dưới). R2 xem ghi chú bên dưới.
 name = "nha-chat-api"
 main = "src/index.js"
 compatibility_date = "2026-09-01"
@@ -12,9 +12,11 @@ binding = "DB"
 database_name = "nha-chat-api-db"
 database_id = "deae60ab-da0c-4e6d-9ab9-c63df4fbd4be"
 
-[[r2_buckets]]
-binding = "BUCKET"
-bucket_name = "nha-chat-files"
+# R2 (ảnh/tệp/ghi âm): tạm tắt vì tài khoản chưa bật được R2.
+# Khi bật R2 và tạo bucket "nha-chat-files", bỏ dấu # ở 3 dòng dưới rồi commit:
+# [[r2_buckets]]
+# binding = "BUCKET"
+# bucket_name = "nha-chat-files"
 
 # Thời gian thực (WebSocket) — Durable Object bản SQLite, miễn phí
 [[durable_objects.bindings]]

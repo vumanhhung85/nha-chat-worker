@@ -2,7 +2,7 @@
  * Nhà Mình — Cloudflare Worker (API + file + Telegram webhook)
  *
  * Triển khai: Cloudflare tự build từ GitHub (repo nha-chat-worker) theo wrangler.toml.
- *   - D1 (DB) và R2 (BUCKET) được Cloudflare tự tạo ở lần deploy đầu.
+ *   - D1 (DB) bắt buộc; R2 (BUCKET) tùy chọn — chưa có thì chỉ nhắn chữ được.
  *   - Bảng dữ liệu được Worker tự tạo ở lần chạy đầu (ensureDb).
  * Secret cần khai báo trong Dashboard (Settings → Variables and Secrets):
  *   SETUP_KEY     : mã cài đặt lần đầu (chỉ Bố biết) — dùng để đặt PIN lần đầu
@@ -592,6 +592,7 @@ function extOf(name, mime) {
   return map[(mime || '').split(';')[0]] || '';
 }
 async function putFile(env, blob, name, mime) {
+  if (!env.BUCKET) throw httpErr(503, 'Kho ảnh/tệp chưa được bật. Tạm thời chỉ nhắn chữ được nhé.', 'no_storage');
   const d = new Date();
   const key = d.getUTCFullYear() + '/' + String(d.getUTCMonth() + 1).padStart(2, '0') + '/' + randHex(12) + extOf(name, mime);
   await env.BUCKET.put(key, blob, { httpMetadata: { contentType: mime || 'application/octet-stream' } });
@@ -622,7 +623,7 @@ async function upload(request, env, me, origin) {
   const thumb = fd.get('thumb');
   if (thumb && typeof thumb !== 'string' && thumb.size > 0 && thumb.size < 1024 * 1024 && (kind === 'image' || kind === 'video')) {
     thumbKey = key + '.t.jpg';
-    await env.BUCKET.put(thumbKey, thumb, { httpMetadata: { contentType: 'image/jpeg' } });
+    if (env.BUCKET) await env.BUCKET.put(thumbKey, thumb, { httpMetadata: { contentType: 'image/jpeg' } });
   }
   const now = Date.now();
   const r = await env.DB.prepare('INSERT INTO attachments (msg_id, uploader, kind, r2_key, thumb_key, name, mime, size, w, h, dur, created_at) VALUES (NULL,?,?,?,?,?,?,?,?,?,?,?) RETURNING id')
@@ -725,7 +726,7 @@ async function recall(env, me, origin, b, ctx) {
   const atts = await env.DB.prepare('SELECT r2_key, thumb_key FROM attachments WHERE msg_id=?').bind(m.id).all();
   const keys = [];
   atts.results.forEach(a => { keys.push(a.r2_key); if (a.thumb_key) keys.push(a.thumb_key); });
-  if (keys.length) {
+  if (keys.length && env.BUCKET) {
     const job = env.BUCKET.delete(keys).catch(() => {});
     if (ctx && ctx.waitUntil) ctx.waitUntil(job); else await job;
   }
@@ -866,6 +867,7 @@ async function serveFile(request, env, url) {
   const expect = (await hmacHex(env, 'f|' + key + '|' + e)).slice(0, 32);
   if (!safeEq(s, expect)) return new Response('Liên kết không hợp lệ', { status: 403 });
 
+  if (!env.BUCKET) return new Response('Kho tệp chưa bật', { status: 404 });
   const hasRange = !!request.headers.get('Range');
   const obj = await env.BUCKET.get(key, hasRange ? { range: request.headers } : undefined);
   if (!obj) return new Response('Không tìm thấy tệp', { status: 404 });
