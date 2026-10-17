@@ -23,3 +23,5 @@ node test/api.test.mjs        # toàn bộ API (D1/R2/Telegram giả lập)
 node test/realtime.test.mjs   # Web Push (giải mã như trình duyệt, kiểm chữ ký VAPID) + Hub
 npx wrangler dev --local --port 8788   # rồi: node test/ws.real.mjs   (WebSocket thật trên workerd; cần file .dev.vars có SETUP_KEY=nha-setup)
 ```
+
+_Cập nhật: kích hoạt build lại trên Cloudflare (Workers Builds)._
