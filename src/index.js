@@ -160,6 +160,20 @@ CREATE TABLE IF NOT EXISTS push_subs (
 );
 CREATE INDEX IF NOT EXISTS idx_push_member ON push_subs(member_id);
 
+CREATE TABLE IF NOT EXISTS calls (
+  id           TEXT PRIMARY KEY,
+  conv_id      TEXT NOT NULL,
+  caller       TEXT NOT NULL,
+  callee       TEXT NOT NULL,
+  video        INTEGER NOT NULL DEFAULT 0,
+  state        TEXT NOT NULL DEFAULT 'ringing',   -- ringing | answered | ended | declined | missed
+  created_at   INTEGER NOT NULL,
+  answered_at  INTEGER,
+  ended_at     INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_calls_callee ON calls(callee, state);
+CREATE INDEX IF NOT EXISTS idx_calls_caller ON calls(caller, state);
+
 -- ---------- Dữ liệu ban đầu: 4 thành viên ----------
 INSERT OR IGNORE INTO members (id, name, avatar, color, role, sort) VALUES
   ('bo',          'Bố Hưng',     '👨', '#2F6FDE', 'parent', 1),
@@ -186,7 +200,7 @@ INSERT OR IGNORE INTO conv_members (conv_id, member_id) VALUES
   ('me_phuongthao','me'), ('me_phuongthao','phuongthao'),
   ('linhnhi_phuongthao','linhnhi'), ('linhnhi_phuongthao','phuongthao');
 `;
-const SCHEMA_V = '2';
+const SCHEMA_V = '3';
 let _dbReady = false;
 async function ensureDb(env) {
   if (_dbReady) return;
@@ -225,7 +239,7 @@ export default {
     }
   }
 };
-const NO_POKE = new Set(['/api/login', '/api/logout', '/api/upload', '/api/admin/telegram', '/api/push/subscribe', '/api/push/unsubscribe']);
+const NO_POKE = new Set(['/api/call/invite', '/api/login', '/api/logout', '/api/upload', '/api/admin/telegram', '/api/push/subscribe', '/api/push/unsubscribe']);
 function runBg(ctx, p) {
   const j = Promise.resolve(p).catch(e => console.log('bg err', e && e.message || e));
   if (ctx && ctx.waitUntil) ctx.waitUntil(j);
@@ -271,6 +285,12 @@ async function route(request, env, url, ctx) {
   if (p === '/api/push/key' && m === 'GET') return ok({ key: (await getVapid(env)).pub });
   if (p === '/api/push/subscribe' && m === 'POST') return ok(await pushSubscribe(env, me, await body(request), request));
   if (p === '/api/push/unsubscribe' && m === 'POST') return ok(await pushUnsubscribe(env, me, await body(request)));
+
+  if (p === '/api/call/ice' && m === 'GET') return ok(await callIce(env));
+  if (p === '/api/call/pending' && m === 'GET') return ok(await callPending(env, me));
+  if (p === '/api/call/invite' && m === 'POST') return ok(await callInvite(env, me, await body(request), ctx));
+  if (p === '/api/call/state' && m === 'POST') return ok(await callState(env, me, origin, await body(request), ctx));
+  if (p === '/api/call/end' && m === 'POST') return ok(await callEnd(env, me, origin, await body(request), ctx));
 
   if (p === '/api/tg/link' && m === 'POST') return ok(await tgLink(env, me));
   if (p === '/api/tg/notify' && m === 'POST') return ok(await tgSetNotify(env, me, await body(request)));
@@ -682,6 +702,7 @@ async function createMessage(env, sender, origin, o, ctx) {
   await env.DB.batch(stmts);
 
   const msg = (await serializeMessages(env, [ins], sender, origin))[0];
+  if (o.quiet) return msg; // tin hệ thống (nhật ký cuộc gọi): không báo Telegram/đẩy
   const job = Promise.all([
     notifyNewMessage(env, origin, ins, sender).catch(e => console.log('tg notify', e)),
     pushNewMessage(env, ins, sender).catch(e => console.log('push', e && e.message || e))
@@ -1180,6 +1201,7 @@ export class Hub {
     this.state = state;
     this.env = env;
     this.convCache = new Map();
+    this.callCache = new Map();
     try { state.setWebSocketAutoResponse(new WebSocketRequestResponsePair('ping', 'pong')); } catch (e) { /* môi trường test */ }
   }
   socks() { return this.state.getWebSockets(); }
@@ -1208,6 +1230,11 @@ export class Hub {
     if (url.pathname === '/poke') {
       let rev = 0; try { rev = (await request.json()).rev || 0; } catch (e) { /* bỏ qua */ }
       this.broadcast({ t: 'rev', rev });
+      return new Response('ok');
+    }
+    if (url.pathname === '/deliver') {
+      let o = {}; try { o = await request.json(); } catch (e) { /* bỏ qua */ }
+      if (o && Array.isArray(o.to) && o.msg) this.broadcast(o.msg, o.to);
       return new Response('ok');
     }
     if (url.pathname === '/visible') {
@@ -1252,6 +1279,21 @@ export class Hub {
       const peers = await this.convPeers(conv);
       if (!peers.includes(a.m)) return;
       this.broadcast({ t: 'typing', conv, m: a.m }, peers.filter(x => x !== a.m), ws);
+    } else if (msg.t === 'sig') {
+      // chuyển tín hiệu WebRTC giữa hai người của 1 cuộc gọi
+      const cid = String(msg.cid || ''), to = String(msg.to || '');
+      if (!cid || !to) return;
+      if (JSON.stringify(msg.d || {}).length > 20000) return;
+      let ent = this.callCache.get(cid);
+      if (!ent) {
+        const row = await this.env.DB.prepare('SELECT caller, callee FROM calls WHERE id=?').bind(cid).first();
+        if (!row) return;
+        ent = { a: row.caller, b: row.callee };
+        if (this.callCache.size > 40) this.callCache.clear();
+        this.callCache.set(cid, ent);
+      }
+      if (!((ent.a === a.m && ent.b === to) || (ent.b === a.m && ent.a === to))) return;
+      this.broadcast({ t: 'sig', from: a.m, cid, d: msg.d || {} }, [to], ws);
     }
   }
   async webSocketClose(ws) {
@@ -1368,6 +1410,148 @@ async function pushSubscribe(env, me, b, request) {
 }
 async function pushUnsubscribe(env, me, b) {
   await env.DB.prepare('DELETE FROM push_subs WHERE endpoint=? AND member_id=?').bind(String(b.endpoint || ''), me.id).run();
+  return { ok: true };
+}
+
+
+/* ------------------------------------------------------------------ */
+/*  Gọi thoại / video 1-1 (WebRTC; máy chủ chỉ báo hiệu + cấp TURN)       */
+/* ------------------------------------------------------------------ */
+const CALL_RING_MS = 45000;
+const CALL_ACTIVE_MS = 3 * 3600000;
+async function hubDeliver(env, to, msg) {
+  const stub = hubStub(env);
+  if (!stub) return;
+  try { await stub.fetch('https://hub/deliver', { method: 'POST', body: JSON.stringify({ to, msg }) }); } catch (e) { /* ok */ }
+}
+function fmtCallDur(sec) {
+  sec = Math.max(0, Math.round(sec));
+  const m = Math.floor(sec / 60), s = sec % 60;
+  return m + ':' + String(s).padStart(2, '0');
+}
+let _ice = null;
+async function callIce(env) {
+  if (_ice && Date.now() - _ice.at < 6 * 3600000) return _ice.v;
+  let servers = null;
+  if (env.TURN_KEY_ID && env.TURN_KEY_API_TOKEN) {
+    try {
+      const r = await fetch('https://rtc.live.cloudflare.com/v1/turn/keys/' + encodeURIComponent(env.TURN_KEY_ID) + '/credentials/generate-ice-servers', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer ' + env.TURN_KEY_API_TOKEN, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ttl: 86400 })
+      });
+      if (r.ok) {
+        const j = await r.json();
+        let list = j && j.iceServers; if (list && !Array.isArray(list)) list = [list];
+        if (Array.isArray(list) && list.length) {
+          servers = list.map(x => {
+            const urls = (Array.isArray(x.urls) ? x.urls : [x.urls]).filter(u => u && !/:53(\?|$)/.test(u));
+            const o = { urls }; if (x.username) { o.username = x.username; o.credential = x.credential; }
+            return o;
+          }).filter(x => x.urls.length);
+        }
+      } else console.log('TURN http', r.status);
+    } catch (e) { console.log('TURN err', e && e.message || e); }
+  }
+  const out = servers
+    ? { iceServers: servers, turn: true }
+    : { iceServers: [{ urls: ['stun:stun.cloudflare.com:3478', 'stun:stun.l.google.com:19302'] }], turn: false };
+  _ice = { at: servers ? Date.now() : Date.now() - 5.5 * 3600000, v: out }; // lỗi thì thử lại sau ~30 phút
+  return out;
+}
+async function callPending(env, me) {
+  const r = await env.DB.prepare("SELECT id, conv_id, caller, video, created_at FROM calls WHERE callee=? AND state='ringing' AND created_at>? ORDER BY created_at DESC LIMIT 1")
+    .bind(me.id, Date.now() - CALL_RING_MS).first();
+  return { call: r ? { cid: r.id, conv: r.conv_id, from: r.caller, video: !!r.video, at: r.created_at } : null };
+}
+async function memberRow(env, id) { return env.DB.prepare('SELECT * FROM members WHERE id=?').bind(id).first(); }
+async function callBusy(env, memberId) {
+  const now = Date.now();
+  const r = await env.DB.prepare(
+    "SELECT id FROM calls WHERE (caller=?1 OR callee=?1) AND ((state='ringing' AND created_at>?2) OR (state='answered' AND answered_at>?3)) LIMIT 1")
+    .bind(memberId, now - CALL_RING_MS - 5000, now - CALL_ACTIVE_MS).first();
+  return !!r;
+}
+async function callInvite(env, me, b, ctx) {
+  const conv = String(b.conv || '');
+  await assertMember(env, me, conv);
+  const c = await env.DB.prepare('SELECT type FROM conversations WHERE id=?').bind(conv).first();
+  if (!c || c.type !== 'direct') throw httpErr(400, 'Chỉ gọi được trong cuộc trò chuyện riêng');
+  const mem = await convMembers(env, conv);
+  const other = mem.find(x => x.id !== me.id);
+  if (!other) throw httpErr(400, 'Không tìm thấy người nhận');
+  const now = Date.now();
+  // cuộc gọi cũ còn treo của chính người gọi → đóng lại
+  await env.DB.prepare("UPDATE calls SET state='ended', ended_at=? WHERE caller=? AND state IN ('ringing','answered')").bind(now, me.id).run();
+  if (await callBusy(env, other.id)) throw httpErr(409, other.name + ' đang bận cuộc gọi khác', 'busy');
+  const cid = randHex(8), video = b.video ? 1 : 0;
+  await env.DB.prepare('INSERT INTO calls (id, conv_id, caller, callee, video, state, created_at) VALUES (?,?,?,?,?,?,?)').bind(cid, conv, me.id, other.id, video, 'ringing', now).run();
+  const msg = { t: 'call', k: 'invite', cid, conv, from: me.id, video: !!video };
+  const job = (async () => {
+    await hubDeliver(env, [other.id], msg);
+    const visible = await hubVisible(env);
+    if (!visible.includes(other.id)) {
+      await pushToMembers(env, [other.id], async () => ({
+        title: me.avatar + ' ' + me.name + ' đang gọi ' + (video ? 'video' : 'thoại'),
+        body: 'Bấm để mở Nhà Mình và nghe máy',
+        call: cid, conv, from: me.id, video: !!video, tag: 'call-' + cid
+      }), { urgency: 'high', ttl: 45 });
+    }
+  })().catch(e => console.log('call invite', e && e.message || e));
+  if (ctx && ctx.waitUntil) ctx.waitUntil(job); else await job;
+  return { cid, expires: CALL_RING_MS };
+}
+async function callLog(env, origin, row, text, ctx) {
+  const caller = await memberRow(env, row.caller);
+  if (!caller) return;
+  await createMessage(env, caller, origin, { conv: row.conv_id, text, via: 'call', quiet: true }, ctx);
+}
+async function callState(env, me, origin, b, ctx) {
+  const row = await env.DB.prepare('SELECT * FROM calls WHERE id=?').bind(String(b.cid || '')).first();
+  if (!row || row.callee !== me.id) throw httpErr(404, 'Không tìm thấy cuộc gọi', 'no_call');
+  if (row.state !== 'ringing' || Date.now() - row.created_at > CALL_RING_MS + 10000) throw httpErr(409, 'Cuộc gọi đã kết thúc', 'ended');
+  const now = Date.now();
+  if (b.state === 'answered') {
+    await env.DB.prepare("UPDATE calls SET state='answered', answered_at=? WHERE id=? AND state='ringing'").bind(now, row.id).run();
+    await hubDeliver(env, [row.caller], { t: 'call', k: 'accepted', cid: row.id });
+    await hubDeliver(env, [row.callee], { t: 'call', k: 'taken', cid: row.id });
+    return { ok: true };
+  }
+  await env.DB.prepare("UPDATE calls SET state='declined', ended_at=? WHERE id=? AND state='ringing'").bind(now, row.id).run();
+  await hubDeliver(env, [row.caller], { t: 'call', k: 'declined', cid: row.id });
+  await hubDeliver(env, [row.callee], { t: 'call', k: 'taken', cid: row.id });
+  await callLog(env, origin, row, (row.video ? '🎥' : '📞') + ' Cuộc gọi bị từ chối', ctx);
+  return { ok: true };
+}
+async function callEnd(env, me, origin, b, ctx) {
+  const row = await env.DB.prepare('SELECT * FROM calls WHERE id=?').bind(String(b.cid || '')).first();
+  if (!row || (row.caller !== me.id && row.callee !== me.id)) throw httpErr(404, 'Không tìm thấy cuộc gọi', 'no_call');
+  if (row.state !== 'ringing' && row.state !== 'answered') return { ok: true, already: true };
+  const now = Date.now(), other = row.caller === me.id ? row.callee : row.caller;
+  const icon = row.video ? '🎥' : '📞';
+  if (row.state === 'answered') {
+    const r = await env.DB.prepare("UPDATE calls SET state='ended', ended_at=? WHERE id=? AND state='answered'").bind(now, row.id).run();
+    if (!(r.meta && r.meta.changes === 0)) {
+      await hubDeliver(env, [other], { t: 'call', k: 'ended', cid: row.id });
+      await callLog(env, origin, row, icon + ' Cuộc gọi ' + (row.video ? 'video' : 'thoại') + ' · ' + fmtCallDur((now - (row.answered_at || now)) / 1000), ctx);
+    }
+    return { ok: true };
+  }
+  // đang đổ chuông
+  if (me.id === row.callee) return await callState(env, me, origin, { cid: row.id, state: 'declined' }, ctx);
+  const r = await env.DB.prepare("UPDATE calls SET state='missed', ended_at=? WHERE id=? AND state='ringing'").bind(now, row.id).run();
+  if (r.meta && r.meta.changes === 0) return { ok: true, already: true };
+  await hubDeliver(env, [other], { t: 'call', k: 'ended', cid: row.id });
+  await callLog(env, origin, row, icon + ' Cuộc gọi nhỡ', ctx);
+  const job = (async () => {
+    const visible = await hubVisible(env);
+    if (visible.includes(other)) return;
+    await pushToMembers(env, [other], async id => ({
+      title: '📵 Cuộc gọi nhỡ', body: me.avatar + ' ' + me.name + ' đã gọi ' + (row.video ? 'video' : 'thoại') + ' cho bạn',
+      conv: row.conv_id, tag: 'call-' + row.id, badge: await unreadFor(env, id)
+    }), { urgency: 'high' });
+  })().catch(e => console.log('missed push', e && e.message || e));
+  if (ctx && ctx.waitUntil) ctx.waitUntil(job); else await job;
   return { ok: true };
 }
 

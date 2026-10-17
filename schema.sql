@@ -133,6 +133,20 @@ CREATE TABLE IF NOT EXISTS push_subs (
 );
 CREATE INDEX IF NOT EXISTS idx_push_member ON push_subs(member_id);
 
+CREATE TABLE IF NOT EXISTS calls (
+  id           TEXT PRIMARY KEY,
+  conv_id      TEXT NOT NULL,
+  caller       TEXT NOT NULL,
+  callee       TEXT NOT NULL,
+  video        INTEGER NOT NULL DEFAULT 0,
+  state        TEXT NOT NULL DEFAULT 'ringing',   -- ringing | answered | ended | declined | missed
+  created_at   INTEGER NOT NULL,
+  answered_at  INTEGER,
+  ended_at     INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_calls_callee ON calls(callee, state);
+CREATE INDEX IF NOT EXISTS idx_calls_caller ON calls(caller, state);
+
 -- ---------- Dữ liệu ban đầu: 4 thành viên ----------
 INSERT OR IGNORE INTO members (id, name, avatar, color, role, sort) VALUES
   ('bo',          'Bố Hưng',     '👨', '#2F6FDE', 'parent', 1),
