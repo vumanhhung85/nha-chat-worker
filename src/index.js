@@ -10,7 +10,7 @@
  *   TG_BOT_TOKEN  : token bot Telegram (hoặc nhập trong app: Cài đặt → Cài đặt hệ thống)
  *   SECRET        : khóa ký link/băm PIN (bỏ trống thì Worker tự sinh và lưu trong D1;
  *                   ĐỪNG thêm/đổi sau khi đã dùng — mọi PIN sẽ phải đặt lại)
- *   APP_URL       : https://nha.tytlinhxuan.cloud (đã khai trong wrangler.toml)
+ *   APP_URL       : https://nha.vmh.io.vn (đã khai trong wrangler.toml)
  */
 
 const MAX_FILE = 25 * 1024 * 1024;       // trần cứng 25MB / file
@@ -304,7 +304,7 @@ function json(obj, status, headers) {
 }
 function corsHeaders(request, env) {
   const origin = request.headers.get('Origin') || '';
-  const allowed = [env.APP_URL || 'https://nha.tytlinhxuan.cloud']
+  const allowed = [env.APP_URL || 'https://nha.vmh.io.vn']
     .concat(String(env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean));
   const okOrigin = allowed.indexOf(origin) >= 0 || /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin);
   return {
@@ -915,7 +915,7 @@ async function tg(env, method, payload, tokenOverride) {
   return r.json();
 }
 async function tgSecret(env) { return (await hmacHex(env, 'tg-webhook')).slice(0, 48); }
-function appUrl(env) { return env.APP_URL || 'https://nha.tytlinhxuan.cloud'; }
+function appUrl(env) { return env.APP_URL || 'https://nha.vmh.io.vn'; }
 
 async function botUsername(env) {
   const row = await env.DB.prepare("SELECT v FROM meta WHERE k='tg_bot'").first();

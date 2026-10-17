@@ -5,7 +5,7 @@ main = "src/index.js"
 compatibility_date = "2026-09-01"
 
 [vars]
-APP_URL = "https://nha.tytlinhxuan.cloud"
+APP_URL = "https://nha.vmh.io.vn"
 
 [[d1_databases]]
 binding = "DB"
