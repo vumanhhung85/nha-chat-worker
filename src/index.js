@@ -376,6 +376,9 @@ async function bumpRev(env) {
   return Number(r.v);
 }
 function esc(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
+const AV_PHOTO = /^data:image\/jpeg;base64,[A-Za-z0-9+\/=]+$/;
+function cleanAvatar(v) { v = String(v || '').trim(); return AV_PHOTO.test(v) && v.length <= 60000 ? v : clip(v, 8); }
+function avTxt(a) { return a && a.indexOf('data:') === 0 ? '🙂' : a; }
 function clip(s, n) { s = String(s || ''); return s.length > n ? s.slice(0, n - 1) + '…' : s; }
 
 /* ------------------------------------------------------------------ */
@@ -843,7 +846,7 @@ async function changeMyPin(env, me, b) {
   return { ok: true };
 }
 async function updateMyProfile(env, me, b) {
-  const avatar = clip(String(b.avatar || '').trim(), 8);
+  const avatar = cleanAvatar(b.avatar);
   if (!avatar) throw httpErr(400, 'Chưa chọn hình đại diện');
   const rev = await bumpRev(env);
   await env.DB.prepare('UPDATE members SET avatar=?, rev=? WHERE id=?').bind(avatar, rev, me.id).run();
@@ -863,7 +866,7 @@ async function adminMember(env, b) {
   const mem = await env.DB.prepare('SELECT * FROM members WHERE id=?').bind(String(b.id || '')).first();
   if (!mem) throw httpErr(404, 'Không tìm thấy thành viên');
   const name = b.name != null ? clip(String(b.name).trim(), 30) : mem.name;
-  const avatar = b.avatar != null ? clip(String(b.avatar).trim(), 8) : mem.avatar;
+  const avatar = b.avatar != null ? cleanAvatar(b.avatar) : mem.avatar;
   const color = b.color != null && /^#[0-9a-fA-F]{6}$/.test(String(b.color)) ? String(b.color) : mem.color;
   if (!name || !avatar) throw httpErr(400, 'Tên và hình đại diện không được trống');
   const rev = await bumpRev(env);
@@ -1024,7 +1027,7 @@ async function notifyNewMessage(env, origin, msg, sender) {
   const conv = await env.DB.prepare('SELECT * FROM conversations WHERE id=?').bind(msg.conv_id).first();
   const atts = (await env.DB.prepare('SELECT * FROM attachments WHERE msg_id=? ORDER BY id').bind(msg.id).all()).results;
   const where = conv.type === 'group' ? '👨‍👩‍👧‍👧 ' + (conv.name || 'Gia đình') : '🔒 nhắn riêng';
-  let lines = ['<b>' + esc(senderRow.avatar + ' ' + senderRow.name) + '</b> · ' + esc(where)];
+  let lines = ['<b>' + esc(avTxt(senderRow.avatar) + ' ' + senderRow.name) + '</b> · ' + esc(where)];
   if (msg.hw_for) {
     const who = msg.hw_for === 'all' ? 'cả hai bé' : ((mem.find(x => x.id === msg.hw_for) || {}).name || '');
     lines.push('📚 <b>Bài tập</b> cho ' + esc(who) + (msg.hw_due ? ' · hạn ' + esc(msg.hw_due.split('-').reverse().join('/')) : ''));
@@ -1052,7 +1055,7 @@ async function notifyNewMessage(env, origin, msg, sender) {
 async function notifyHwDone(env, origin, msg, kid) {
   const parents = (await env.DB.prepare("SELECT * FROM members WHERE role='parent' AND tg_chat_id IS NOT NULL AND tg_notify != 'off'").all()).results;
   const inConv = await convMembers(env, msg.conv_id);
-  const text = '✅ <b>' + esc(kid.avatar + ' ' + kid.name) + '</b> đã làm xong bài tập:\n' +
+  const text = '✅ <b>' + esc(avTxt(kid.avatar) + ' ' + kid.name) + '</b> đã làm xong bài tập:\n' +
     (msg.body ? '“' + esc(clip(msg.body, 300)) + '”' : '(bài tập có tệp đính kèm)') +
     '\n<i>↩️ Trả lời tin này để khen con</i>';
   for (const p of parents) {
@@ -1100,7 +1103,7 @@ async function tgMessage(env, origin, m, ctx) {
       env.DB.prepare('DELETE FROM tg_links WHERE code=?').bind(code)
     ]);
     const mem = await env.DB.prepare('SELECT * FROM members WHERE id=?').bind(link.member_id).first();
-    await tg(env, 'sendMessage', { chat_id: chatId, parse_mode: 'HTML', text: '✅ Đã kết nối Nhà Mình với <b>' + esc(mem.avatar + ' ' + mem.name) + '</b>.\n\nKhi có tin mới, bot sẽ báo ở đây. Muốn nhắn lại, hãy vuốt <b>Trả lời</b> vào thông báo đó.' });
+    await tg(env, 'sendMessage', { chat_id: chatId, parse_mode: 'HTML', text: '✅ Đã kết nối Nhà Mình với <b>' + esc(avTxt(mem.avatar) + ' ' + mem.name) + '</b>.\n\nKhi có tin mới, bot sẽ báo ở đây. Muốn nhắn lại, hãy vuốt <b>Trả lời</b> vào thông báo đó.' });
     return;
   }
 
@@ -1492,7 +1495,7 @@ async function callInvite(env, me, b, ctx) {
     const visible = await hubVisible(env);
     if (!visible.includes(other.id)) {
       await pushToMembers(env, [other.id], async () => ({
-        title: me.avatar + ' ' + me.name + ' đang gọi ' + (video ? 'video' : 'thoại'),
+        title: avTxt(me.avatar) + ' ' + me.name + ' đang gọi ' + (video ? 'video' : 'thoại'),
         body: 'Bấm để mở Nhà Mình và nghe máy',
         call: cid, conv, from: me.id, video: !!video, tag: 'call-' + cid
       }), { urgency: 'high', ttl: 45 });
@@ -1547,7 +1550,7 @@ async function callEnd(env, me, origin, b, ctx) {
     const visible = await hubVisible(env);
     if (visible.includes(other)) return;
     await pushToMembers(env, [other], async id => ({
-      title: '📵 Cuộc gọi nhỡ', body: me.avatar + ' ' + me.name + ' đã gọi ' + (row.video ? 'video' : 'thoại') + ' cho bạn',
+      title: '📵 Cuộc gọi nhỡ', body: avTxt(me.avatar) + ' ' + me.name + ' đã gọi ' + (row.video ? 'video' : 'thoại') + ' cho bạn',
       conv: row.conv_id, tag: 'call-' + row.id, badge: await unreadFor(env, id)
     }), { urgency: 'high' });
   })().catch(e => console.log('missed push', e && e.message || e));
@@ -1590,7 +1593,7 @@ async function pushNewMessage(env, msg, sender) {
     preview = a.kind === 'image' ? '🖼️ Ảnh' : a.kind === 'video' ? '🎬 Video' : a.kind === 'voice' ? '🎤 Tin nhắn thoại' : '📎 ' + (a.name || 'Tệp');
   }
   if (msg.hw_for) preview = '📚 Bài tập: ' + (preview || '(xem trong app)');
-  const title = senderRow.avatar + ' ' + senderRow.name + (conv && conv.type === 'group' ? ' · ' + (conv.name || 'Gia đình') : '');
+  const title = avTxt(senderRow.avatar) + ' ' + senderRow.name + (conv && conv.type === 'group' ? ' · ' + (conv.name || 'Gia đình') : '');
   await pushToMembers(env, targets, async id => ({
     title, body: preview, conv: msg.conv_id, msg: msg.id, tag: 'c-' + msg.conv_id, badge: await unreadFor(env, id)
   }), { urgency: 'high' });
@@ -1602,7 +1605,7 @@ async function pushHwDone(env, msg, kid) {
   const visible = await hubVisible(env);
   const targets = parents.filter(x => !visible.includes(x));
   await pushToMembers(env, targets, async id => ({
-    title: '✅ ' + kid.avatar + ' ' + kid.name + ' đã làm xong bài tập',
+    title: '✅ ' + avTxt(kid.avatar) + ' ' + kid.name + ' đã làm xong bài tập',
     body: msg.body ? clip(msg.body, 120) : '(bài tập có tệp đính kèm)',
     conv: msg.conv_id, msg: msg.id, tag: 'hw-' + msg.id, badge: await unreadFor(env, id)
   }), { urgency: 'high' });
