@@ -182,9 +182,10 @@ CREATE TABLE IF NOT EXISTS docs (
   mime        TEXT,
   size        INTEGER NOT NULL,
   r2_key      TEXT NOT NULL,
-  created_at  INTEGER NOT NULL
+  created_at  INTEGER NOT NULL,
+  parent      INTEGER NOT NULL DEFAULT 0,      -- 0 = gốc; ngược lại là id thư mục cha
+  kind        TEXT NOT NULL DEFAULT 'file'     -- 'file' | 'folder'
 );
-CREATE INDEX IF NOT EXISTS idx_docs_owner ON docs(space, owner, id);
 
 -- ---------- Dữ liệu ban đầu: 4 thành viên ----------
 INSERT OR IGNORE INTO members (id, name, avatar, color, role, sort) VALUES
@@ -212,7 +213,7 @@ INSERT OR IGNORE INTO conv_members (conv_id, member_id) VALUES
   ('me_phuongthao','me'), ('me_phuongthao','phuongthao'),
   ('linhnhi_phuongthao','linhnhi'), ('linhnhi_phuongthao','phuongthao');
 `;
-const SCHEMA_V = '4';
+const SCHEMA_V = '5';
 let _dbReady = false;
 async function ensureDb(env) {
   if (_dbReady) return;
@@ -222,6 +223,9 @@ async function ensureDb(env) {
   } catch (e) { /* chưa có bảng */ }
   const stmts = SCHEMA.split(/;\s*\n/).map(x => x.replace(/^\s*--.*$/gm, '').trim()).filter(Boolean);
   await env.DB.batch(stmts.map(x => env.DB.prepare(x)));
+  // nâng cấp bảng docs cũ (v4) lên có thư mục
+  for (const q of ["ALTER TABLE docs ADD COLUMN parent INTEGER NOT NULL DEFAULT 0", "ALTER TABLE docs ADD COLUMN kind TEXT NOT NULL DEFAULT 'file'"]) { try { await env.DB.prepare(q).run(); } catch (e) { /* đã có cột */ } }
+  await env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_docs_dir ON docs(space, owner, parent)").run();
   await env.DB.prepare("INSERT INTO meta (k, v) VALUES ('schema_v', ?) ON CONFLICT(k) DO UPDATE SET v=excluded.v").bind(SCHEMA_V).run();
   _dbReady = true;
 }
@@ -283,7 +287,11 @@ async function route(request, env, url, ctx) {
   if (p === '/api/pinned' && m === 'GET') return ok(await listPinned(env, me, origin, url.searchParams.get('conv')));
   if (p === '/api/homework' && m === 'GET') return ok(await listHomework(env, me, origin));
   if (p === '/api/upload' && m === 'POST') return ok(await upload(request, env, me, origin));
-  if (p === '/api/docs' && m === 'GET') return ok(await docsList(env, me, origin, url.searchParams.get('space')));
+  if (p === '/api/docs' && m === 'GET') return ok(await docsList(env, me, origin, url.searchParams.get('space'), url.searchParams.get('parent')));
+  if (p === '/api/docs/folder' && m === 'POST') return ok(await docsMkdir(env, me, await body(request)));
+  if (p === '/api/docs/rename' && m === 'POST') return ok(await docsRename(env, me, await body(request)));
+  if (p === '/api/docs/move' && m === 'POST') return ok(await docsMove(env, me, await body(request)));
+  if (p === '/api/docs/copy' && m === 'POST') return ok(await docsCopy(env, me, await body(request)));
   if (p === '/api/docs/start' && m === 'POST') return ok(await docsStart(env, me, await body(request)));
   if (p === '/api/docs/part' && m === 'POST') return ok(await docsPart(request, env, me, url));
   if (p === '/api/docs/finish' && m === 'POST') return ok(await docsFinish(env, me, origin, await body(request)));
@@ -325,6 +333,8 @@ async function route(request, env, url, ctx) {
     if (p === '/api/admin/member' && m === 'POST') return ok(await adminMember(env, await body(request)));
     if (p === '/api/tg/setup' && m === 'POST') return ok(await tgSetup(env, origin));
     if (p === '/api/admin/telegram' && m === 'POST') return ok(await tgSaveToken(env, origin, await body(request)));
+    if (p === '/api/admin/docs-config' && m === 'GET') return ok(await docsCfgGet(env));
+    if (p === '/api/admin/docs-config' && m === 'POST') return ok(await docsCfgSet(env, await body(request)));
     if (p === '/api/admin/status' && m === 'GET') return ok(await adminStatus(env));
   }
   throw httpErr(404, 'Không có chức năng này: ' + m + ' ' + p, 'unknown_action');
@@ -680,10 +690,33 @@ async function upload(request, env, me, origin) {
 /* ------------------------------------------------------------------ */
 const MB = 1024 * 1024;
 const DOC_CHUNK = 8 * MB;
-const DOC_MAX_FILE = 2048 * MB;
-function docQuota(env, me, space) {
-  if (space === 'shared') return int(env.SHARED_QUOTA_MB, 5120) * MB;
-  return (me.id === 'bo' ? 2048 : 200) * MB;
+const DOC_COPY_MAX = 500 * MB;      // sao chép/chuyển kho qua Worker: tệp tối đa 500MB
+/* ----- Cài đặt kho (bố mẹ chỉnh được, lưu trong meta) ----- */
+async function docsCfgGet(env) {
+  const def = { quota: { bo: 2048 }, quota_default: 200, shared: int(env.SHARED_QUOTA_MB, 5120), max_file: 2048 };
+  let cur = {};
+  try { const r = await env.DB.prepare("SELECT v FROM meta WHERE k='docs_cfg'").first(); if (r) cur = JSON.parse(r.v) || {}; } catch (e) {}
+  const mem = (await env.DB.prepare('SELECT id,name FROM members ORDER BY sort').all()).results;
+  const quota = {};
+  mem.forEach(x => { const v = cur.quota && cur.quota[x.id] != null ? Number(cur.quota[x.id]) : (def.quota[x.id] != null ? def.quota[x.id] : (cur.quota_default != null ? Number(cur.quota_default) : def.quota_default)); quota[x.id] = v; });
+  return {
+    quota, shared: cur.shared != null ? Number(cur.shared) : def.shared, max_file: cur.max_file != null ? Number(cur.max_file) : def.max_file,
+    members: mem.map(x => ({ id: x.id, name: x.name }))
+  };
+}
+async function docsCfgSet(env, b) {
+  const num = (v, name) => { const n = Number(v); if (!isFinite(n) || n < 0 || n > 10000000) throw httpErr(400, name + ' không hợp lệ (MB, 0 – 10.000.000)'); return Math.round(n); };
+  const cur = await docsCfgGet(env);
+  const q = {};
+  for (const id of Object.keys(cur.quota)) q[id] = b.quota && b.quota[id] != null ? num(b.quota[id], 'Dung lượng thành viên') : cur.quota[id];
+  const out = { quota: q, shared: b.shared != null ? num(b.shared, 'Kho chung') : cur.shared, max_file: b.max_file != null ? num(b.max_file, 'Dung lượng tệp tối đa') : cur.max_file };
+  if (out.max_file < 1) throw httpErr(400, 'Dung lượng tệp tối đa phải ≥ 1MB');
+  await env.DB.prepare("INSERT INTO meta (k, v) VALUES ('docs_cfg', ?) ON CONFLICT(k) DO UPDATE SET v=excluded.v").bind(JSON.stringify(out)).run();
+  return docsCfgGet(env);
+}
+async function docQuota(env, me, space) {
+  const c = await docsCfgGet(env);
+  return (space === 'shared' ? c.shared : (c.quota[me.id] != null ? c.quota[me.id] : 200)) * MB;
 }
 function docSpace(v) { if (v !== 'mine' && v !== 'shared') throw httpErr(400, 'Kho không hợp lệ'); return v; }
 async function docUsed(env, me, space) {
@@ -693,32 +726,86 @@ async function docUsed(env, me, space) {
   return Number(r.n) || 0;
 }
 function needBucket(env) { if (!env.BUCKET) throw httpErr(503, 'Kho tệp chưa được bật', 'no_storage'); }
-function docKeyOk(me, key) { return /^docs\/(mine\/([a-z0-9_]+)|shared\/([a-z0-9_]+))\/[0-9a-f]{24}(\.[a-z0-9]{1,6})?$/.test(key) && (key.indexOf('docs/mine/') !== 0 || key.split('/')[2] === me.id) && (key.indexOf('docs/shared/') !== 0 || key.split('/')[2] === me.id); }
+function docKeyOk(me, key) { return /^docs\/(mine|shared)\/[a-z0-9_]+\/[0-9a-f]{24}(\.[a-z0-9]{1,6})?$/.test(key) && key.split('/')[2] === me.id; }
 async function copyObj(env, fromKey, toKey, mime) {
   const o = await env.BUCKET.get(fromKey);
   if (!o) throw httpErr(404, 'Không tìm thấy tệp');
   await env.BUCKET.put(toKey, o.body, { httpMetadata: { contentType: mime || 'application/octet-stream' } });
 }
 function newKey(prefix, name, mime) { return prefix + randHex(12) + extOf(name, mime); }
+function canModDoc(me, d) { return d.owner === me.id || (d.space === 'shared' && me.role === 'parent'); }
+async function docGet(env, me, id) {
+  const d = await env.DB.prepare('SELECT * FROM docs WHERE id=?').bind(int(id)).first();
+  if (!d || (d.space === 'mine' && d.owner !== me.id)) throw httpErr(404, 'Không tìm thấy mục này');
+  return d;
+}
+async function docParent(env, me, space, parent) {
+  parent = int(parent, 0);
+  if (!parent) return 0;
+  const f = await docGet(env, me, parent);
+  if (f.kind !== 'folder' || f.space !== space) throw httpErr(400, 'Thư mục không hợp lệ');
+  return parent;
+}
+async function docTree(env, rootIds) {   // trả về tất cả mục (kể cả thư mục con) dưới các id gốc
+  const out = [], seen = new Set();
+  let level = rootIds.slice();
+  while (level.length && out.length < 5000) {
+    const rows = (await env.DB.prepare('SELECT * FROM docs WHERE id IN (SELECT value FROM json_each(?))').bind(JSON.stringify(level)).all()).results;
+    level = [];
+    for (const r of rows) {
+      if (seen.has(r.id)) continue; seen.add(r.id); out.push(r);
+      if (r.kind === 'folder') {
+        const ch = (await env.DB.prepare('SELECT id FROM docs WHERE parent=? AND space=? ').bind(r.id, r.space).all()).results;
+        ch.forEach(c => level.push(c.id));
+      }
+    }
+  }
+  return out;
+}
+function cleanName(v) { const n = String(v || '').replace(/[\\/\u0000-\u001f]/g, ' ').trim(); if (!n) throw httpErr(400, 'Tên không được để trống'); return clip(n, 120); }
 
-async function docsList(env, me, origin, space) {
+async function docsList(env, me, origin, space, parent) {
   space = docSpace(space);
+  parent = int(parent, 0);
   const rows = space === 'shared'
-    ? await env.DB.prepare("SELECT * FROM docs WHERE space='shared' ORDER BY id DESC LIMIT 500").all()
-    : await env.DB.prepare("SELECT * FROM docs WHERE space='mine' AND owner=? ORDER BY id DESC LIMIT 500").bind(me.id).all();
+    ? await env.DB.prepare("SELECT * FROM docs WHERE space='shared' AND parent=? ORDER BY (kind='folder') DESC, name COLLATE NOCASE LIMIT 1000").bind(parent).all()
+    : await env.DB.prepare("SELECT * FROM docs WHERE space='mine' AND owner=? AND parent=? ORDER BY (kind='folder') DESC, name COLLATE NOCASE LIMIT 1000").bind(me.id, parent).all();
   const items = [];
   for (const d of rows.results) {
-    items.push({ id: d.id, name: d.name, mime: d.mime, size: d.size, owner: d.owner, at: d.created_at, url: await signedUrl(env, origin, d.r2_key, d.name), can_del: d.owner === me.id || me.role === 'parent' });
+    items.push({ id: d.id, kind: d.kind, name: d.name, mime: d.mime, size: d.size, owner: d.owner, at: d.created_at, can_del: canModDoc(me, d),
+      url: d.kind === 'file' ? await signedUrl(env, origin, d.r2_key, d.name) : null });
   }
-  return { space, items, used: await docUsed(env, me, space), quota: docQuota(env, me, space) };
+  const path = [];
+  let cur = parent;
+  for (let i = 0; cur && i < 20; i++) {
+    const f = await env.DB.prepare('SELECT id,name,parent,space,owner FROM docs WHERE id=?').bind(cur).first();
+    if (!f || f.space !== space || (space === 'mine' && f.owner !== me.id)) break;
+    path.unshift({ id: f.id, name: f.name }); cur = f.parent;
+  }
+  const cfg = await docsCfgGet(env);
+  return { space, parent, path, items, used: await docUsed(env, me, space), quota: await docQuota(env, me, space), max_file: cfg.max_file * MB };
+}
+async function docsMkdir(env, me, b) {
+  const space = docSpace(b.space), parent = await docParent(env, me, space, b.parent);
+  const r = await env.DB.prepare("INSERT INTO docs (space, owner, name, mime, size, r2_key, created_at, parent, kind) VALUES (?,?,?,NULL,0,'',?,?, 'folder') RETURNING id")
+    .bind(space, me.id, cleanName(b.name), Date.now(), parent).first();
+  return { id: r.id };
+}
+async function docsRename(env, me, b) {
+  const d = await docGet(env, me, b.id);
+  if (!canModDoc(me, d)) throw httpErr(403, 'Bạn không đổi tên được mục này');
+  await env.DB.prepare('UPDATE docs SET name=? WHERE id=?').bind(cleanName(b.name), d.id).run();
+  return { ok: true };
 }
 async function docsStart(env, me, b) {
   needBucket(env);
   const space = docSpace(b.space);
+  await docParent(env, me, space, b.parent);
   const size = int(b.size, 0);
   if (size <= 0) throw httpErr(400, 'Tệp rỗng');
-  if (size > DOC_MAX_FILE) throw httpErr(413, 'Tệp quá lớn (tối đa 2GB)');
-  const used = await docUsed(env, me, space), quota = docQuota(env, me, space);
+  const cfg = await docsCfgGet(env);
+  if (size > cfg.max_file * MB) throw httpErr(413, 'Tệp quá lớn (tối đa ' + cfg.max_file + 'MB)', 'too_big');
+  const used = await docUsed(env, me, space), quota = await docQuota(env, me, space);
   if (used + size > quota) throw httpErr(413, 'Hết dung lượng: còn ' + Math.max(0, Math.floor((quota - used) / MB)) + 'MB trong ' + (space === 'shared' ? 'Kho chung' : 'My Documents'), 'quota');
   const name = clip(String(b.name || 'tep'), 120), mime = String(b.mime || 'application/octet-stream');
   const key = newKey('docs/' + space + '/' + me.id + '/', name, mime);
@@ -743,28 +830,89 @@ async function docsAbort(env, me, b) {
 async function docsFinish(env, me, origin, b) {
   needBucket(env);
   const space = docSpace(b.space), key = String(b.key || '');
-  if (!docKeyOk(me, key) || !Array.isArray(b.parts) || !b.parts.length) throw httpErr(400, 'Sai thông tin tải lên');
+  if (!docKeyOk(me, key) || key.split('/')[1] !== space || !Array.isArray(b.parts) || !b.parts.length) throw httpErr(400, 'Sai thông tin tải lên');
+  const parent = await docParent(env, me, space, b.parent);
   const obj = await env.BUCKET.resumeMultipartUpload(key, String(b.uploadId || '')).complete(b.parts.map(x => ({ partNumber: int(x.partNumber), etag: String(x.etag) })));
   const size = obj && obj.size != null ? obj.size : (await env.BUCKET.head(key)).size;
   const used = await docUsed(env, me, space);
-  if (used + size > docQuota(env, me, space)) { await env.BUCKET.delete(key); throw httpErr(413, 'Hết dung lượng', 'quota'); }
+  if (used + size > await docQuota(env, me, space)) { await env.BUCKET.delete(key); throw httpErr(413, 'Hết dung lượng', 'quota'); }
   const name = clip(String(b.name || 'tep'), 120), mime = String(b.mime || 'application/octet-stream');
-  const r = await env.DB.prepare('INSERT INTO docs (space, owner, name, mime, size, r2_key, created_at) VALUES (?,?,?,?,?,?,?) RETURNING id')
-    .bind(space, me.id, name, mime, size, key, Date.now()).first();
+  const r = await env.DB.prepare("INSERT INTO docs (space, owner, name, mime, size, r2_key, created_at, parent, kind) VALUES (?,?,?,?,?,?,?,?, 'file') RETURNING id")
+    .bind(space, me.id, name, mime, size, key, Date.now(), parent).first();
   return { id: r.id, size };
 }
 async function docsDelete(env, me, b) {
-  const d = await env.DB.prepare('SELECT * FROM docs WHERE id=?').bind(int(b.id)).first();
-  if (!d) throw httpErr(404, 'Không tìm thấy tệp');
-  if (!(d.owner === me.id || (d.space === 'shared' && me.role === 'parent'))) throw httpErr(403, 'Bạn không xóa được tệp này');
-  await env.DB.prepare('DELETE FROM docs WHERE id=?').bind(d.id).run();
-  if (env.BUCKET) await env.BUCKET.delete(d.r2_key).catch(() => {});
-  return { ok: true };
+  const ids = (Array.isArray(b.ids) ? b.ids : [b.id]).map(x => int(x)).filter(Boolean).slice(0, 200);
+  let n = 0;
+  for (const id of ids) {
+    const d = await docGet(env, me, id);
+    if (!canModDoc(me, d)) throw httpErr(403, 'Bạn không xóa được "' + d.name + '"');
+    const tree = await docTree(env, [d.id]);
+    if (tree.some(x => !canModDoc(me, x))) throw httpErr(403, 'Thư mục "' + d.name + '" có tệp của người khác, bạn không xóa được');
+    const keys = tree.filter(x => x.kind === 'file' && x.r2_key).map(x => x.r2_key);
+    for (let i = 0; i < tree.length; i += 90) await env.DB.prepare('DELETE FROM docs WHERE id IN (SELECT value FROM json_each(?))').bind(JSON.stringify(tree.slice(i, i + 90).map(x => x.id))).run();
+    if (env.BUCKET) for (let i = 0; i < keys.length; i += 900) await env.BUCKET.delete(keys.slice(i, i + 900)).catch(() => {});
+    n += tree.length;
+  }
+  return { ok: true, deleted: n };
 }
-async function docGet(env, me, id) {
-  const d = await env.DB.prepare('SELECT * FROM docs WHERE id=?').bind(int(id)).first();
-  if (!d || (d.space === 'mine' && d.owner !== me.id)) throw httpErr(404, 'Không tìm thấy tệp');
-  return d;
+/** Di chuyển: cùng kho → chỉ đổi thư mục cha; khác kho → sao chép rồi xóa bản gốc */
+async function docsMove(env, me, b) {
+  const ids = (Array.isArray(b.ids) ? b.ids : []).map(x => int(x)).filter(Boolean).slice(0, 200);
+  if (!ids.length) throw httpErr(400, 'Chưa chọn mục nào');
+  const ts = docSpace(b.space), tp = await docParent(env, me, ts, b.parent);
+  const docs = [];
+  for (const id of ids) { const d = await docGet(env, me, id); if (!canModDoc(me, d)) throw httpErr(403, 'Bạn không di chuyển được "' + d.name + '"'); docs.push(d); }
+  const cross = docs.some(d => d.space !== ts);
+  if (cross) {
+    await docsCopy(env, me, { ids, space: ts, parent: tp });
+    await docsDelete(env, me, { ids });
+    return { ok: true, moved: ids.length };
+  }
+  // chặn đưa thư mục vào chính nó / con của nó
+  if (tp) {
+    let cur = tp;
+    for (let i = 0; cur && i < 30; i++) {
+      if (ids.indexOf(cur) >= 0) throw httpErr(400, 'Không thể chuyển thư mục vào chính nó');
+      const f = await env.DB.prepare('SELECT parent FROM docs WHERE id=?').bind(cur).first(); cur = f ? f.parent : 0;
+    }
+  }
+  for (const d of docs) await env.DB.prepare('UPDATE docs SET parent=? WHERE id=?').bind(tp, d.id).run();
+  return { ok: true, moved: ids.length };
+}
+async function docsCopy(env, me, b) {
+  needBucket(env);
+  const ids = (Array.isArray(b.ids) ? b.ids : []).map(x => int(x)).filter(Boolean).slice(0, 200);
+  if (!ids.length) throw httpErr(400, 'Chưa chọn mục nào');
+  const ts = docSpace(b.space), tp = await docParent(env, me, ts, b.parent);
+  const roots = [];
+  for (const id of ids) roots.push(await docGet(env, me, id));
+  const tree = await docTree(env, roots.map(r => r.id));
+  const files = tree.filter(x => x.kind === 'file');
+  const total = files.reduce((a, x) => a + x.size, 0);
+  const big = files.find(x => x.size > DOC_COPY_MAX);
+  if (big) throw httpErr(413, '"' + big.name + '" lớn hơn 500MB, không sao chép trong kho được');
+  const used = await docUsed(env, me, ts);
+  if (used + total > await docQuota(env, me, ts)) throw httpErr(413, 'Không đủ dung lượng để sao chép (cần ' + Math.ceil(total / MB) + 'MB)', 'quota');
+  const map = new Map();   // id cũ → id mới
+  const rootSet = new Set(roots.map(r => r.id));
+  // thư mục cha trước, con sau: sắp theo độ sâu bằng cách lặp cho tới khi xử lý hết
+  let pending = tree.slice(), guard = 0;
+  while (pending.length && guard++ < 50) {
+    const rest = [];
+    for (const d of pending) {
+      const isRoot = rootSet.has(d.id);
+      if (!isRoot && !map.has(d.parent)) { rest.push(d); continue; }
+      const newParent = isRoot ? tp : map.get(d.parent);
+      let key = '';
+      if (d.kind === 'file') { key = newKey('docs/' + ts + '/' + me.id + '/', d.name, d.mime); await copyObj(env, d.r2_key, key, d.mime); }
+      const r = await env.DB.prepare('INSERT INTO docs (space, owner, name, mime, size, r2_key, created_at, parent, kind) VALUES (?,?,?,?,?,?,?,?,?) RETURNING id')
+        .bind(ts, me.id, d.name, d.mime, d.size, key, Date.now(), newParent, d.kind).first();
+      map.set(d.id, r.id);
+    }
+    pending = rest;
+  }
+  return { ok: true, copied: tree.length };
 }
 /** Lưu tệp trong 1 tin nhắn vào kho */
 async function docsSave(env, me, origin, b) {
@@ -775,17 +923,18 @@ async function docsSave(env, me, origin, b) {
   await assertMember(env, me, a.conv_id);
   if (a.hidden_at && me.role !== 'parent') throw httpErr(403, 'Không có quyền');
   const used = await docUsed(env, me, space);
-  if (used + a.size > docQuota(env, me, space)) throw httpErr(413, 'Hết dung lượng ' + (space === 'shared' ? 'Kho chung' : 'My Documents'), 'quota');
+  if (used + a.size > await docQuota(env, me, space)) throw httpErr(413, 'Hết dung lượng ' + (space === 'shared' ? 'Kho chung' : 'My Documents'), 'quota');
   const key = newKey('docs/' + space + '/' + me.id + '/', a.name, a.mime);
   await copyObj(env, a.r2_key, key, a.mime);
   const name = a.name || ('tep' + extOf('', a.mime));
-  await env.DB.prepare('INSERT INTO docs (space, owner, name, mime, size, r2_key, created_at) VALUES (?,?,?,?,?,?,?)').bind(space, me.id, name, a.mime, a.size, key, Date.now()).run();
+  await env.DB.prepare("INSERT INTO docs (space, owner, name, mime, size, r2_key, created_at, parent, kind) VALUES (?,?,?,?,?,?,?,0,'file')").bind(space, me.id, name, a.mime, a.size, key, Date.now()).run();
   return { ok: true };
 }
 /** Biến 1 tệp trong kho thành tệp đính kèm để gửi vào chat (≤25MB) */
 async function docsAttach(env, me, b) {
   needBucket(env);
   const d = await docGet(env, me, b.id);
+  if (d.kind !== 'file') throw httpErr(400, 'Đây là thư mục');
   if (d.size > MAX_FILE) throw httpErr(413, 'Tệp lớn hơn 25MB, không gửi vào chat được — hãy mở trong Kho để tải về');
   const key = await (async () => { const k = newKeyChat(d.name, d.mime); await copyObj(env, d.r2_key, k, d.mime); return k; })();
   const kind = kindOf(d.mime, '');

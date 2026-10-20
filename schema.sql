@@ -155,9 +155,11 @@ CREATE TABLE IF NOT EXISTS docs (
   mime        TEXT,
   size        INTEGER NOT NULL,
   r2_key      TEXT NOT NULL,
-  created_at  INTEGER NOT NULL
+  created_at  INTEGER NOT NULL,
+  parent      INTEGER NOT NULL DEFAULT 0,
+  kind        TEXT NOT NULL DEFAULT 'file'
 );
-CREATE INDEX IF NOT EXISTS idx_docs_owner ON docs(space, owner, id);
+CREATE INDEX IF NOT EXISTS idx_docs_dir ON docs(space, owner, parent);
 
 -- ---------- Dữ liệu ban đầu: 4 thành viên ----------
 INSERT OR IGNORE INTO members (id, name, avatar, color, role, sort) VALUES
