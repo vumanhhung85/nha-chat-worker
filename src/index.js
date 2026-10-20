@@ -174,6 +174,18 @@ CREATE TABLE IF NOT EXISTS calls (
 CREATE INDEX IF NOT EXISTS idx_calls_callee ON calls(callee, state);
 CREATE INDEX IF NOT EXISTS idx_calls_caller ON calls(caller, state);
 
+CREATE TABLE IF NOT EXISTS docs (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  space       TEXT NOT NULL,            -- 'mine' (My Documents, riêng từng người) | 'shared' (Kho chung)
+  owner       TEXT NOT NULL,
+  name        TEXT NOT NULL,
+  mime        TEXT,
+  size        INTEGER NOT NULL,
+  r2_key      TEXT NOT NULL,
+  created_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_docs_owner ON docs(space, owner, id);
+
 -- ---------- Dữ liệu ban đầu: 4 thành viên ----------
 INSERT OR IGNORE INTO members (id, name, avatar, color, role, sort) VALUES
   ('bo',          'Bố Hưng',     '👨', '#2F6FDE', 'parent', 1),
@@ -200,7 +212,7 @@ INSERT OR IGNORE INTO conv_members (conv_id, member_id) VALUES
   ('me_phuongthao','me'), ('me_phuongthao','phuongthao'),
   ('linhnhi_phuongthao','linhnhi'), ('linhnhi_phuongthao','phuongthao');
 `;
-const SCHEMA_V = '3';
+const SCHEMA_V = '4';
 let _dbReady = false;
 async function ensureDb(env) {
   if (_dbReady) return;
@@ -239,7 +251,7 @@ export default {
     }
   }
 };
-const NO_POKE = new Set(['/api/call/invite', '/api/login', '/api/logout', '/api/upload', '/api/admin/telegram', '/api/push/subscribe', '/api/push/unsubscribe']);
+const NO_POKE = new Set(['/api/call/invite', '/api/login', '/api/logout', '/api/upload', '/api/docs/part', '/api/docs/start', '/api/docs/abort', '/api/admin/telegram', '/api/push/subscribe', '/api/push/unsubscribe']);
 function runBg(ctx, p) {
   const j = Promise.resolve(p).catch(e => console.log('bg err', e && e.message || e));
   if (ctx && ctx.waitUntil) ctx.waitUntil(j);
@@ -271,6 +283,15 @@ async function route(request, env, url, ctx) {
   if (p === '/api/pinned' && m === 'GET') return ok(await listPinned(env, me, origin, url.searchParams.get('conv')));
   if (p === '/api/homework' && m === 'GET') return ok(await listHomework(env, me, origin));
   if (p === '/api/upload' && m === 'POST') return ok(await upload(request, env, me, origin));
+  if (p === '/api/docs' && m === 'GET') return ok(await docsList(env, me, origin, url.searchParams.get('space')));
+  if (p === '/api/docs/start' && m === 'POST') return ok(await docsStart(env, me, await body(request)));
+  if (p === '/api/docs/part' && m === 'POST') return ok(await docsPart(request, env, me, url));
+  if (p === '/api/docs/finish' && m === 'POST') return ok(await docsFinish(env, me, origin, await body(request)));
+  if (p === '/api/docs/abort' && m === 'POST') return ok(await docsAbort(env, me, await body(request)));
+  if (p === '/api/docs/delete' && m === 'POST') return ok(await docsDelete(env, me, await body(request)));
+  if (p === '/api/docs/save' && m === 'POST') return ok(await docsSave(env, me, origin, await body(request)));
+  if (p === '/api/docs/attach' && m === 'POST') return ok(await docsAttach(env, me, await body(request)));
+  if (p === '/api/forward' && m === 'POST') return ok(await forwardMsg(env, me, origin, await body(request), ctx));
   if (p === '/api/send' && m === 'POST') return ok(await sendFromApp(env, me, origin, await body(request), ctx));
   if (p === '/api/react' && m === 'POST') return ok(await react(env, me, origin, await body(request)));
   if (p === '/api/recall' && m === 'POST') return ok(await recall(env, me, origin, await body(request), ctx));
@@ -652,6 +673,152 @@ async function upload(request, env, me, origin) {
   const r = await env.DB.prepare('INSERT INTO attachments (msg_id, uploader, kind, r2_key, thumb_key, name, mime, size, w, h, dur, created_at) VALUES (NULL,?,?,?,?,?,?,?,?,?,?,?) RETURNING id')
     .bind(me.id, kind, key, thumbKey, name, mime, file.size, int(fd.get('w')) || null, int(fd.get('h')) || null, int(fd.get('dur')) || null, now).first();
   return { id: r.id, kind, name, size: file.size };
+}
+
+/* ------------------------------------------------------------------ */
+/*  Kho: My Documents (riêng) + Kho chung (cả nhà) — lưu trong R2       */
+/* ------------------------------------------------------------------ */
+const MB = 1024 * 1024;
+const DOC_CHUNK = 8 * MB;
+const DOC_MAX_FILE = 2048 * MB;
+function docQuota(env, me, space) {
+  if (space === 'shared') return int(env.SHARED_QUOTA_MB, 5120) * MB;
+  return (me.id === 'bo' ? 2048 : 200) * MB;
+}
+function docSpace(v) { if (v !== 'mine' && v !== 'shared') throw httpErr(400, 'Kho không hợp lệ'); return v; }
+async function docUsed(env, me, space) {
+  const r = space === 'shared'
+    ? await env.DB.prepare("SELECT COALESCE(SUM(size),0) AS n FROM docs WHERE space='shared'").first()
+    : await env.DB.prepare("SELECT COALESCE(SUM(size),0) AS n FROM docs WHERE space='mine' AND owner=?").bind(me.id).first();
+  return Number(r.n) || 0;
+}
+function needBucket(env) { if (!env.BUCKET) throw httpErr(503, 'Kho tệp chưa được bật', 'no_storage'); }
+function docKeyOk(me, key) { return /^docs\/(mine\/([a-z0-9_]+)|shared\/([a-z0-9_]+))\/[0-9a-f]{24}(\.[a-z0-9]{1,6})?$/.test(key) && (key.indexOf('docs/mine/') !== 0 || key.split('/')[2] === me.id) && (key.indexOf('docs/shared/') !== 0 || key.split('/')[2] === me.id); }
+async function copyObj(env, fromKey, toKey, mime) {
+  const o = await env.BUCKET.get(fromKey);
+  if (!o) throw httpErr(404, 'Không tìm thấy tệp');
+  await env.BUCKET.put(toKey, o.body, { httpMetadata: { contentType: mime || 'application/octet-stream' } });
+}
+function newKey(prefix, name, mime) { return prefix + randHex(12) + extOf(name, mime); }
+
+async function docsList(env, me, origin, space) {
+  space = docSpace(space);
+  const rows = space === 'shared'
+    ? await env.DB.prepare("SELECT * FROM docs WHERE space='shared' ORDER BY id DESC LIMIT 500").all()
+    : await env.DB.prepare("SELECT * FROM docs WHERE space='mine' AND owner=? ORDER BY id DESC LIMIT 500").bind(me.id).all();
+  const items = [];
+  for (const d of rows.results) {
+    items.push({ id: d.id, name: d.name, mime: d.mime, size: d.size, owner: d.owner, at: d.created_at, url: await signedUrl(env, origin, d.r2_key, d.name), can_del: d.owner === me.id || me.role === 'parent' });
+  }
+  return { space, items, used: await docUsed(env, me, space), quota: docQuota(env, me, space) };
+}
+async function docsStart(env, me, b) {
+  needBucket(env);
+  const space = docSpace(b.space);
+  const size = int(b.size, 0);
+  if (size <= 0) throw httpErr(400, 'Tệp rỗng');
+  if (size > DOC_MAX_FILE) throw httpErr(413, 'Tệp quá lớn (tối đa 2GB)');
+  const used = await docUsed(env, me, space), quota = docQuota(env, me, space);
+  if (used + size > quota) throw httpErr(413, 'Hết dung lượng: còn ' + Math.max(0, Math.floor((quota - used) / MB)) + 'MB trong ' + (space === 'shared' ? 'Kho chung' : 'My Documents'), 'quota');
+  const name = clip(String(b.name || 'tep'), 120), mime = String(b.mime || 'application/octet-stream');
+  const key = newKey('docs/' + space + '/' + me.id + '/', name, mime);
+  const mp = await env.BUCKET.createMultipartUpload(key, { httpMetadata: { contentType: mime } });
+  return { key, uploadId: mp.uploadId, chunk: DOC_CHUNK };
+}
+async function docsPart(request, env, me, url) {
+  needBucket(env);
+  const key = url.searchParams.get('key') || '', uploadId = url.searchParams.get('uploadId') || '', n = int(url.searchParams.get('n'), 0);
+  if (!docKeyOk(me, key) || !uploadId || n < 1 || n > 10000) throw httpErr(400, 'Sai thông tin tải lên');
+  const buf = await request.arrayBuffer();
+  if (!buf.byteLength || buf.byteLength > DOC_CHUNK + 1024) throw httpErr(413, 'Mảnh tải lên không hợp lệ');
+  const part = await env.BUCKET.resumeMultipartUpload(key, uploadId).uploadPart(n, buf);
+  return { partNumber: n, etag: part.etag };
+}
+async function docsAbort(env, me, b) {
+  needBucket(env);
+  if (!docKeyOk(me, String(b.key || ''))) throw httpErr(400, 'Sai thông tin');
+  try { await env.BUCKET.resumeMultipartUpload(b.key, String(b.uploadId || '')).abort(); } catch (e) {}
+  return { ok: true };
+}
+async function docsFinish(env, me, origin, b) {
+  needBucket(env);
+  const space = docSpace(b.space), key = String(b.key || '');
+  if (!docKeyOk(me, key) || !Array.isArray(b.parts) || !b.parts.length) throw httpErr(400, 'Sai thông tin tải lên');
+  const obj = await env.BUCKET.resumeMultipartUpload(key, String(b.uploadId || '')).complete(b.parts.map(x => ({ partNumber: int(x.partNumber), etag: String(x.etag) })));
+  const size = obj && obj.size != null ? obj.size : (await env.BUCKET.head(key)).size;
+  const used = await docUsed(env, me, space);
+  if (used + size > docQuota(env, me, space)) { await env.BUCKET.delete(key); throw httpErr(413, 'Hết dung lượng', 'quota'); }
+  const name = clip(String(b.name || 'tep'), 120), mime = String(b.mime || 'application/octet-stream');
+  const r = await env.DB.prepare('INSERT INTO docs (space, owner, name, mime, size, r2_key, created_at) VALUES (?,?,?,?,?,?,?) RETURNING id')
+    .bind(space, me.id, name, mime, size, key, Date.now()).first();
+  return { id: r.id, size };
+}
+async function docsDelete(env, me, b) {
+  const d = await env.DB.prepare('SELECT * FROM docs WHERE id=?').bind(int(b.id)).first();
+  if (!d) throw httpErr(404, 'Không tìm thấy tệp');
+  if (!(d.owner === me.id || (d.space === 'shared' && me.role === 'parent'))) throw httpErr(403, 'Bạn không xóa được tệp này');
+  await env.DB.prepare('DELETE FROM docs WHERE id=?').bind(d.id).run();
+  if (env.BUCKET) await env.BUCKET.delete(d.r2_key).catch(() => {});
+  return { ok: true };
+}
+async function docGet(env, me, id) {
+  const d = await env.DB.prepare('SELECT * FROM docs WHERE id=?').bind(int(id)).first();
+  if (!d || (d.space === 'mine' && d.owner !== me.id)) throw httpErr(404, 'Không tìm thấy tệp');
+  return d;
+}
+/** Lưu tệp trong 1 tin nhắn vào kho */
+async function docsSave(env, me, origin, b) {
+  needBucket(env);
+  const space = docSpace(b.space);
+  const a = await env.DB.prepare('SELECT a.*, m.conv_id, m.hidden_at, m.recalled_at FROM attachments a JOIN messages m ON m.id=a.msg_id WHERE a.id=?').bind(int(b.att)).first();
+  if (!a || a.recalled_at) throw httpErr(404, 'Không tìm thấy tệp');
+  await assertMember(env, me, a.conv_id);
+  if (a.hidden_at && me.role !== 'parent') throw httpErr(403, 'Không có quyền');
+  const used = await docUsed(env, me, space);
+  if (used + a.size > docQuota(env, me, space)) throw httpErr(413, 'Hết dung lượng ' + (space === 'shared' ? 'Kho chung' : 'My Documents'), 'quota');
+  const key = newKey('docs/' + space + '/' + me.id + '/', a.name, a.mime);
+  await copyObj(env, a.r2_key, key, a.mime);
+  const name = a.name || ('tep' + extOf('', a.mime));
+  await env.DB.prepare('INSERT INTO docs (space, owner, name, mime, size, r2_key, created_at) VALUES (?,?,?,?,?,?,?)').bind(space, me.id, name, a.mime, a.size, key, Date.now()).run();
+  return { ok: true };
+}
+/** Biến 1 tệp trong kho thành tệp đính kèm để gửi vào chat (≤25MB) */
+async function docsAttach(env, me, b) {
+  needBucket(env);
+  const d = await docGet(env, me, b.id);
+  if (d.size > MAX_FILE) throw httpErr(413, 'Tệp lớn hơn 25MB, không gửi vào chat được — hãy mở trong Kho để tải về');
+  const key = await (async () => { const k = newKeyChat(d.name, d.mime); await copyObj(env, d.r2_key, k, d.mime); return k; })();
+  const kind = kindOf(d.mime, '');
+  const r = await env.DB.prepare('INSERT INTO attachments (msg_id, uploader, kind, r2_key, thumb_key, name, mime, size, w, h, dur, created_at) VALUES (NULL,?,?,?,NULL,?,?,?,NULL,NULL,NULL,?) RETURNING id')
+    .bind(me.id, kind, key, d.name, d.mime, d.size, Date.now()).first();
+  return { id: r.id, kind, name: d.name, size: d.size };
+}
+function newKeyChat(name, mime) { const d = new Date(); return d.getUTCFullYear() + '/' + String(d.getUTCMonth() + 1).padStart(2, '0') + '/' + randHex(12) + extOf(name, mime); }
+/** Chuyển tiếp 1 tin sang các cuộc trò chuyện khác */
+async function forwardMsg(env, me, origin, b, ctx) {
+  const m = await getMsg(env, me, b.id);
+  if (m.recalled_at) throw httpErr(400, 'Tin đã thu hồi');
+  if (m.hidden_at && me.role !== 'parent') throw httpErr(403, 'Không có quyền');
+  const convs = (Array.isArray(b.convs) ? b.convs : []).map(String).slice(0, 8);
+  if (!convs.length) throw httpErr(400, 'Chưa chọn nơi nhận');
+  for (const c of convs) await assertMember(env, me, c);
+  const atts = (await env.DB.prepare('SELECT * FROM attachments WHERE msg_id=? ORDER BY id').bind(m.id).all()).results;
+  if (atts.length) needBucket(env);
+  const sent = [];
+  for (const c of convs) {
+    const ids = [];
+    for (const a of atts) {
+      const key = newKeyChat(a.name, a.mime);
+      await copyObj(env, a.r2_key, key, a.mime);
+      let tk = null;
+      if (a.thumb_key) { tk = key + '.t.jpg'; await copyObj(env, a.thumb_key, tk, 'image/jpeg'); }
+      const r = await env.DB.prepare('INSERT INTO attachments (msg_id, uploader, kind, r2_key, thumb_key, name, mime, size, w, h, dur, created_at) VALUES (NULL,?,?,?,?,?,?,?,?,?,?,?) RETURNING id')
+        .bind(me.id, a.kind, key, tk, a.name, a.mime, a.size, a.w, a.h, a.dur, Date.now()).first();
+      ids.push(r.id);
+    }
+    sent.push(await createMessage(env, me, origin, { conv: c, text: m.body || '', atts: ids, via: 'app' }, ctx));
+  }
+  return { sent: sent.length };
 }
 
 /* ------------------------------------------------------------------ */

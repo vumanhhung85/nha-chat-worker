@@ -147,6 +147,18 @@ CREATE TABLE IF NOT EXISTS calls (
 CREATE INDEX IF NOT EXISTS idx_calls_callee ON calls(callee, state);
 CREATE INDEX IF NOT EXISTS idx_calls_caller ON calls(caller, state);
 
+CREATE TABLE IF NOT EXISTS docs (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  space       TEXT NOT NULL,
+  owner       TEXT NOT NULL,
+  name        TEXT NOT NULL,
+  mime        TEXT,
+  size        INTEGER NOT NULL,
+  r2_key      TEXT NOT NULL,
+  created_at  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_docs_owner ON docs(space, owner, id);
+
 -- ---------- Dữ liệu ban đầu: 4 thành viên ----------
 INSERT OR IGNORE INTO members (id, name, avatar, color, role, sort) VALUES
   ('bo',          'Bố Hưng',     '👨', '#2F6FDE', 'parent', 1),
