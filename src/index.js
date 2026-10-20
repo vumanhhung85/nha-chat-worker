@@ -273,6 +273,10 @@ async function route(request, env, url, ctx) {
   if (p === '/api/members' && m === 'GET') return ok(await publicMembers(env));
   if (p === '/api/login' && m === 'POST') return ok(await login(env, await body(request)));
 
+  // ---- Kho chung truy cập nhanh bằng mật khẩu (không phải thành viên) ----
+  if (p === '/api/kho/login' && m === 'POST') return ok(await khoLogin(env, await body(request)));
+  if (p === '/api/kho' || p.startsWith('/api/kho/')) return ok(await khoRoute(request, env, url, p, m));
+
   // ---- cần đăng nhập ----
   const me = await auth(request, env);
   const origin = url.origin;
@@ -333,6 +337,8 @@ async function route(request, env, url, ctx) {
     if (p === '/api/admin/member' && m === 'POST') return ok(await adminMember(env, await body(request)));
     if (p === '/api/tg/setup' && m === 'POST') return ok(await tgSetup(env, origin));
     if (p === '/api/admin/telegram' && m === 'POST') return ok(await tgSaveToken(env, origin, await body(request)));
+    if (p === '/api/admin/kho' && m === 'GET') return ok({ enabled: !!(await khoCfg(env)) });
+    if (p === '/api/admin/kho' && m === 'POST') return ok(await khoSetPassword(env, await body(request)));
     if (p === '/api/admin/docs-config' && m === 'GET') return ok(await docsCfgGet(env));
     if (p === '/api/admin/docs-config' && m === 'POST') return ok(await docsCfgSet(env, await body(request)));
     if (p === '/api/admin/status' && m === 'GET') return ok(await adminStatus(env));
@@ -914,6 +920,74 @@ async function docsCopy(env, me, b) {
   }
   return { ok: true, copied: tree.length };
 }
+/* ------------------------------------------------------------------ */
+/*  Kho chung truy cập nhanh: nha.vmh.io.vn/kho + mật khẩu             */
+/* ------------------------------------------------------------------ */
+const KHO_TTL = 8 * 3600 * 1000;
+async function khoCfg(env) {
+  const r = await env.DB.prepare("SELECT v FROM meta WHERE k='kho_pw'").first();
+  try { return r ? JSON.parse(r.v) : null; } catch (e) { return null; }
+}
+async function khoSign(env, exp, epoch) { return (await hmacHex(env, 'kho|' + exp + '|' + epoch)).slice(0, 32); }
+async function khoSetPassword(env, b) {
+  const pw = String(b.password || '');
+  if (!pw) { await env.DB.prepare("DELETE FROM meta WHERE k='kho_pw'").run(); return { enabled: false }; }
+  if (pw.length < 6) throw httpErr(400, 'Mật khẩu Kho cần từ 6 ký tự trở lên');
+  const salt = randHex(8);
+  await env.DB.prepare("INSERT INTO meta (k, v) VALUES ('kho_pw', ?) ON CONFLICT(k) DO UPDATE SET v=excluded.v")
+    .bind(JSON.stringify({ salt, hash: await hmacHex(env, 'khopw|' + salt + '|' + pw), epoch: Date.now() })).run();
+  await env.DB.prepare("DELETE FROM meta WHERE k='kho_fail'").run();
+  return { enabled: true };
+}
+async function khoLogin(env, b) {
+  const cfg = await khoCfg(env);
+  if (!cfg) throw httpErr(404, 'Chưa bật Kho truy cập nhanh');
+  const now = Date.now();
+  let f = { n: 0, until: 0 };
+  try { const r = await env.DB.prepare("SELECT v FROM meta WHERE k='kho_fail'").first(); if (r) f = JSON.parse(r.v); } catch (e) {}
+  if (f.until > now) throw httpErr(429, 'Nhập sai nhiều lần, thử lại sau ' + Math.ceil((f.until - now) / 60000) + ' phút', 'locked');
+  const hash = await hmacHex(env, 'khopw|' + cfg.salt + '|' + String(b.password || ''));
+  if (!safeEq(hash, cfg.hash)) {
+    f.n = (f.n || 0) + 1;
+    if (f.n >= 5) { f = { n: 0, until: now + 15 * 60000 }; }
+    await env.DB.prepare("INSERT INTO meta (k, v) VALUES ('kho_fail', ?) ON CONFLICT(k) DO UPDATE SET v=excluded.v").bind(JSON.stringify(f)).run();
+    throw httpErr(401, 'Mật khẩu không đúng', 'bad_pw');
+  }
+  await env.DB.prepare("DELETE FROM meta WHERE k='kho_fail'").run();
+  const exp = now + KHO_TTL;
+  return { token: 'kho.' + exp + '.' + (await khoSign(env, exp, cfg.epoch)), exp };
+}
+async function khoAuth(env, request) {
+  const h = request.headers.get('Authorization') || '';
+  const t = h.startsWith('Bearer ') ? h.slice(7).trim() : '';
+  const [pre, exp, sig] = t.split('.');
+  const cfg = await khoCfg(env);
+  if (pre !== 'kho' || !cfg || !(Number(exp) > Date.now()) || !safeEq(sig || '', await khoSign(env, exp, cfg.epoch))) throw httpErr(401, 'Hết phiên, hãy nhập lại mật khẩu', 'no_auth');
+  return { id: 'kho', name: 'Kho chung', role: 'parent' };
+}
+async function khoRoute(request, env, url, p, m) {
+  const me = await khoAuth(env, request);
+  const origin = url.origin;
+  const sub = p.slice('/api/kho'.length);
+  if (sub === '' && m === 'GET') {
+    const d = await docsList(env, me, origin, 'shared', url.searchParams.get('parent'));
+    d.members = (await env.DB.prepare('SELECT id,name FROM members ORDER BY sort').all()).results.concat([{ id: 'kho', name: 'Kho (mật khẩu)' }]);
+    return d;
+  }
+  if (m !== 'POST') throw httpErr(404, 'Không có chức năng này', 'unknown_action');
+  if (sub === '/part') return docsPart(request, env, me, url);
+  const b = await body(request); b.space = 'shared';
+  if (sub === '/start') return docsStart(env, me, b);
+  if (sub === '/finish') return docsFinish(env, me, origin, b);
+  if (sub === '/abort') return docsAbort(env, me, b);
+  if (sub === '/folder') return docsMkdir(env, me, b);
+  if (sub === '/rename') return docsRename(env, me, b);
+  if (sub === '/move') return docsMove(env, me, b);
+  if (sub === '/copy') return docsCopy(env, me, b);
+  if (sub === '/delete') return docsDelete(env, me, b);
+  throw httpErr(404, 'Không có chức năng này', 'unknown_action');
+}
+
 /** Lưu tệp trong 1 tin nhắn vào kho */
 async function docsSave(env, me, origin, b) {
   needBucket(env);
