@@ -255,7 +255,7 @@ export default {
     }
   }
 };
-const NO_POKE = new Set(['/api/call/invite', '/api/login', '/api/logout', '/api/upload', '/api/docs/part', '/api/docs/start', '/api/docs/abort', '/api/admin/telegram', '/api/push/subscribe', '/api/push/unsubscribe']);
+const NO_POKE = new Set(['/api/call/invite', '/api/login', '/api/logout', '/api/upload', '/api/docs/part', '/api/docs/upload', '/api/docs/start', '/api/docs/abort', '/api/admin/telegram', '/api/push/subscribe', '/api/push/unsubscribe']);
 function runBg(ctx, p) {
   const j = Promise.resolve(p).catch(e => console.log('bg err', e && e.message || e));
   if (ctx && ctx.waitUntil) ctx.waitUntil(j);
@@ -297,6 +297,7 @@ async function route(request, env, url, ctx) {
   if (p === '/api/docs/move' && m === 'POST') return ok(await docsMove(env, me, await body(request)));
   if (p === '/api/docs/copy' && m === 'POST') return ok(await docsCopy(env, me, await body(request)));
   if (p === '/api/docs/start' && m === 'POST') return ok(await docsStart(env, me, await body(request)));
+  if (p === '/api/docs/upload' && m === 'POST') return ok(await docsUploadOne(request, env, me, url));
   if (p === '/api/docs/part' && m === 'POST') return ok(await docsPart(request, env, me, url));
   if (p === '/api/docs/finish' && m === 'POST') return ok(await docsFinish(env, me, origin, await body(request)));
   if (p === '/api/docs/abort' && m === 'POST') return ok(await docsAbort(env, me, await body(request)));
@@ -976,6 +977,7 @@ async function khoRoute(request, env, url, p, m) {
   }
   if (m !== 'POST') throw httpErr(404, 'Không có chức năng này', 'unknown_action');
   if (sub === '/part') return docsPart(request, env, me, url);
+  if (sub === '/upload') { url.searchParams.set('space', 'shared'); return docsUploadOne(request, env, me, url); }
   const b = await body(request); b.space = 'shared';
   if (sub === '/start') return docsStart(env, me, b);
   if (sub === '/finish') return docsFinish(env, me, origin, b);
@@ -986,6 +988,33 @@ async function khoRoute(request, env, url, p, m) {
   if (sub === '/copy') return docsCopy(env, me, b);
   if (sub === '/delete') return docsDelete(env, me, b);
   throw httpErr(404, 'Không có chức năng này', 'unknown_action');
+}
+
+/** Tải lên 1 tệp bằng 1 yêu cầu duy nhất (≤ 95MB) — dùng cho "tải ngầm" (Background Fetch) khi thoát app */
+const DOC_ONE_MAX = 95 * MB;
+async function docsUploadOne(request, env, me, url) {
+  needBucket(env);
+  const q = url.searchParams;
+  const space = docSpace(q.get('space'));
+  const parent = await docParent(env, me, space, q.get('parent'));
+  const name = clip(String(q.get('name') || 'tep'), 120), mime = String(q.get('mime') || request.headers.get('Content-Type') || 'application/octet-stream');
+  let size = int(request.headers.get('Content-Length'), 0), data = request.body;
+  if (size <= 0) { const buf = await request.arrayBuffer(); size = buf.byteLength; data = buf; }
+  if (size <= 0) throw httpErr(400, 'Tệp rỗng');
+  if (size > DOC_ONE_MAX) throw httpErr(413, 'Tệp quá lớn cho tải nhanh');
+  const cfg = await docsCfgGet(env);
+  if (size > cfg.max_file * MB) throw httpErr(413, 'Tệp quá lớn (tối đa ' + cfg.max_file + 'MB)', 'too_big');
+  let replace = null;
+  if (q.get('replace')) { replace = await docGet(env, me, q.get('replace')); if (!canModDoc(me, replace) || replace.kind !== 'file') throw httpErr(403, 'Không ghi đè được'); }
+  const used = await docUsed(env, me, space) - (replace ? replace.size : 0);
+  if (used + size > await docQuota(env, me, space)) throw httpErr(413, 'Hết dung lượng', 'quota');
+  const key = newKey('docs/' + space + '/' + me.id + '/', name, mime);
+  const obj = await env.BUCKET.put(key, data, { httpMetadata: { contentType: mime } });
+  const real = obj && obj.size != null ? obj.size : size;
+  const r = await env.DB.prepare("INSERT INTO docs (space, owner, name, mime, size, r2_key, created_at, parent, kind) VALUES (?,?,?,?,?,?,?,?, 'file') RETURNING id")
+    .bind(space, me.id, name, mime, real, key, Date.now(), parent).first();
+  if (replace) { await env.DB.prepare('DELETE FROM docs WHERE id=?').bind(replace.id).run(); await env.BUCKET.delete(replace.r2_key).catch(() => {}); }
+  return { id: r.id, size: real };
 }
 
 /** Lưu tệp trong 1 tin nhắn vào kho */
